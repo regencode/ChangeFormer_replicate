@@ -19,17 +19,16 @@ class SDPA(nn.Module):
     '''
     def __init__(self, d_head=64):
         super().__init__()
-        self.heads = torch.tensor(d_head) # convert to tensor with 1 value for gpu processing
+        self.scale = d_head ** 0.5
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
         N, HW, C = Q.shape
-        K = K.permute(0, 2, 1)
-        logits = torch.bmm(Q, K)
-        logits /= torch.sqrt(self.heads)
-
+        logits = torch.bmm(Q, K.transpose(1, 2))
+        logits /= self.scale
         assert logits.shape == (N, HW, HW), logits.shape
-        softmaxed_logits = F.softmax(logits, dim=1)
-        return softmaxed_logits @ V
+
+        attn = F.softmax(logits, dim=-1)
+        return torch.bmm(attn, V)
 
 N = 1
 C = 3
