@@ -4,14 +4,56 @@ import math
 import jaxtyping
 from torch import nn
 import torch.nn.functional as F
+import time
+
+start = time.time()
+
+#===========================================================
+
+#           Helper functions
+#   Shape conversions (N, C, W, H) -> (N, W*H, C)
+#   (N, C, W, H) required by convs and output
+#   (N, W*H, C) required by nn.Linear and Transformer blocks
+
+#===========================================================
+
+class ConvertToForm(nn.Module):
+    def __init__(self, target_form: str):
+        super().__init__()
+        self.target_form = target_form
+    def forward(self, x: torch.Tensor):
+        if self.target_form == "image":
+            '''
+            convert to shape (N, C, W, H)
+            '''
+            N, WH, C = x.shape
+            x = x.permute(0, 2, 1)
+
+            assert WH == int(WH**0.5) * int(WH**0.5), f'''ConvertToForm("image") error: WH ({WH}) is not perfect square'''
+            x = x.reshape((N, C, int(WH**0.5), int(WH**0.5)))
+
+            return x
+        elif self.target_form == "linear":
+            '''
+            convert to shape (N, WH, C)
+            '''
+            N, C, W, H = x.shape
+            x = x.flatten(start_dim=-2)
+            x = x.permute(0, 2, 1)
+            assert x.shape == (N, W*H, C), x.shape
+
+            return x
+        else:
+            return -1
 
 #=============================================
 
 #           Transformer Block
-#   note: For transformer permute C dimension
-#   to the back.
+#   note: For transformer and nn.Linear 
+#   permute C dimension to the back.
 
 #=============================================
+
 
 class SDPA(nn.Module):
     '''
@@ -41,28 +83,7 @@ v = torch.rand(N, (H*W), C)
 sdpa = SDPA(d_head=64)
 res = sdpa(q, k, v)
 assert res.shape == (N, H*W, C), res
-print("SDPA assert passed")
-
-class MHSA(nn.Module):
-    def __init__(self, in_channels, d_head=64):
-        super().__init__()
-        self.q_proj = nn.Linear(in_channels, d_head)
-        self.k_proj = nn.Linear(in_channels, d_head)
-        self.v_proj = nn.Linear(in_channels, d_head)
-        self.sdpa = SDPA(d_head)
-        self.out_proj = nn.Linear(d_head, in_channels)
-
-    def forward(self, x):
-        return self.out_proj(self.sdpa(self.q_proj(x), self.k_proj(x), self.v_proj(x)))
-
-N, C, W, H = 1, 32, 128, 128
-d_head = 16
-x = torch.rand(N, W*H, C)
-mhsa = MHSA(32, d_head=d_head)
-res = mhsa(x)
-assert res.shape == (N, W*H, 32), res.shape
-print("MHSA assert passed")
-
+print(f"SDPA assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class SequenceReducer(nn.Module):
     def __init__(self, in_channels, reduce_ratio=4):
@@ -73,6 +94,7 @@ class SequenceReducer(nn.Module):
         N, WH, C = x.shape
 
         h_new = (WH)//self.R
+        assert WH == (WH//self.R) * self.R, f"{WH} not divisible by {self.R}"
         w_new = (C*self.R)
         x = self.linear(x.reshape(N, h_new, w_new))
         return x
@@ -82,7 +104,45 @@ N, C, W, H = 1, 32, 64, 64
 x = torch.rand(N, W*H, C)
 res = sr(x)
 assert res.shape == (1, (H*W)/4, C), f"{res.shape} != (1, {(H*W)/4}, {C})"
-print("SequenceReducer assert passed")
+print(f"SequenceReducer assert passed | Elapsed time: {time.time() - start:.4f}s")
+
+class MHSA(nn.Module):
+    def __init__(self, in_channels, d_head=64, reduce_ratio=4):
+        super().__init__()
+        self.reduce_ratio = reduce_ratio
+        self.d_head = d_head
+        self.seq_reduce = SequenceReducer(in_channels, reduce_ratio)
+        self.q_proj = nn.Linear(in_channels, d_head)
+        self.k_proj = nn.Linear(in_channels, d_head)
+        self.v_proj = nn.Linear(in_channels, d_head)
+        self.sdpa = SDPA(d_head)
+        self.out_proj = nn.Linear(d_head//reduce_ratio, in_channels)
+
+    def forward(self, x: torch.Tensor):
+        N, WH, C = x.shape
+        reduce_ratio = self.reduce_ratio
+        d_head = self.d_head
+
+        x = self.seq_reduce(x)
+        assert x.shape == (N, WH//reduce_ratio, C), x.shape
+
+        x = self.sdpa(self.q_proj(x), self.k_proj(x), self.v_proj(x))
+        assert x.shape == (N, WH//reduce_ratio, d_head), f"{x.shape} != ({N}, {WH//reduce_ratio}, {d_head})"
+        
+        x = x.reshape((N, WH, d_head//reduce_ratio)) # restore spatial dim
+        x = self.out_proj(x) # restore in_channels from d_head
+
+        assert x.shape == (N, WH, C), f"{x.shape} != ({N}, {WH}, {C})"
+        return x 
+
+N, C, W, H = 1, 32, 128, 128
+d_head = 16
+x = torch.rand(N, W*H, C)
+mhsa = MHSA(32, d_head=d_head, reduce_ratio=4)
+res = mhsa(x)
+assert res.shape == (N, W*H, 32), res.shape
+print(f"MHSA assert passed | Elapsed time: {time.time() - start:.4f}s")
+
 
 class PositionalEncoder(nn.Module):
     def __init__(self, in_channels, embed_dims=64):
@@ -113,35 +173,36 @@ x = torch.rand(N, W*H, C)
 res = pe(x)
 assert res.shape == x.shape, f"{res.shape} != {x.shape}"
 assert res.shape == (N, W*H, C), f"{res.shape}"
-print("PositionalEncoder assert passed")
+print(f"PositionalEncoder assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, in_channels, N=4, reduce_ratio=4): 
+    def __init__(self, in_channels, N=4, reduce_ratio=16, d_head=64, pos_embed_dims=64): 
         super().__init__()
         self.reduce_ratio = reduce_ratio
         self.blocks = nn.ModuleList([
-                nn.Sequential(
-                    SequenceReducer(in_channels, reduce_ratio=self.reduce_ratio),
-                    MHSA(in_channels, d_head=64),
-                    PositionalEncoder(in_channels, embed_dims=64)
-                )
-                for _ in range(N)
+            nn.Sequential(
+                MHSA(in_channels, d_head=d_head, reduce_ratio=reduce_ratio),
+                PositionalEncoder(in_channels, embed_dims=pos_embed_dims)
+            )
+            for _ in range(N)
         ])
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         for block in self.blocks:
             x = block(x)
         return x
 
 
-reduce_ratio = 4
+reduce_ratio = 16
 N_blocks = 4
 transformer = TransformerBlock(32, N=N_blocks, reduce_ratio=reduce_ratio)
 N, C, W, H = 1, 32, 256, 256
+# Time Complexity per Reduced MHSA -> O((WH^2)/R)
+# Time Complexity per Transformer -> O(N(WH^2)/R)
 x = torch.rand(N, W*H, C)
 res = transformer(x)
-assert res.shape == (N, W*H/(reduce_ratio**N_blocks), C), res.shape
-print("Transformer assert passed")
+assert res.shape == (N, W*H, C), res.shape
+print(f"Transformer assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 
 #=================================================
@@ -156,14 +217,23 @@ class Downsampling(nn.Module):
     Halves spatial dimensions
     '''
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=2, padding=1):
+        super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
 
     def forward(self, x):
         return self.conv(x);
 
+N, C, W, H = 1, 32, 128, 128
+ds = Downsampling(32, 64)
+x = torch.rand(N, C, W, H)
+res = ds(x)
+assert res.shape == (N, 64, W/2, H/2), res.shape
+print(f"Downsampling assert passed | Elapsed time: {time.time() - start:.4f}s")
+
 
 class DifferenceModule(nn.Module):
     def __init__(self, in_channels, out_channels):
+        super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=(3, 3), padding=1)
         self.bn = nn.BatchNorm2d(num_features=out_channels)
     
@@ -171,6 +241,14 @@ class DifferenceModule(nn.Module):
         x = torch.cat([x_pre, x_post], dim=1) # concat along dim
         x = self.conv(x);
         return self.bn(F.relu(x))
+
+N, C, W, H = 1, 32, 128, 128
+diff = DifferenceModule(C*2, C)
+x1 = torch.rand(N, C, W, H)
+x2 = torch.rand(N, C, W, H)
+res = diff(x1, x2)
+assert res.shape == (N, C, W, H), res.shape
+print(f"DifferenceModule assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 #============================================================
 
@@ -180,53 +258,183 @@ class DifferenceModule(nn.Module):
 
 class MLPUpsampler(nn.Module):
     def __init__(self, in_channels, embed_dims=64, upsample_to_size=(128, 128)):
+        super().__init__()
+        self.embed_dims = embed_dims
         self.linear = nn.Linear(in_features=in_channels, out_features=embed_dims)
         self.output_size = upsample_to_size
         
     def forward(self, x):
+        N, WH, C = x.shape
         x = self.linear(x);
+
+        assert x.shape == (N, WH, self.embed_dims), x.shape
+        assert WH == int(WH**0.5) * int(WH**0.5), f"{WH} != {int(WH**0.5)} * {int(WH**0.5)}"
+
+        x = torch.permute(x, (0, 2, 1))
+        assert x.shape == (N, self.embed_dims, WH), x.shape
+
+        x = torch.reshape(x, (N, self.embed_dims, int(WH**0.5), int(WH**0.5)))
         x = F.interpolate(x, size=self.output_size, mode='bilinear')
         return x
 
 class MLPFusion(nn.Module):
     def __init__(self, embed_dims=64):
+        super().__init__()
         self.linear = nn.Linear(in_features=embed_dims*4, out_features=embed_dims)
 
     def forward(self, x1, x2, x3, x4):
+        N, C, W, H = x1.shape
+
         x = torch.cat([x1, x2, x3, x4], dim=1)
+        x = torch.flatten(x, start_dim=2)
+        x = torch.permute(x, (0, 2, 1))
+
         return self.linear(x)
 
-class ConvUpsampler(nn.Module):
+N, C, W, H = 1, 8, 128, 128
+F1 = torch.rand(N, W*H, C)
+F2 = torch.rand(N, (W*H)//4, C*2)
+F3 = torch.rand(N, (W*H)//16, C*4)
+F4 = torch.rand(N, (W*H)//64, C*8)
+
+mlp_up1 = MLPUpsampler(C, embed_dims=16, upsample_to_size=(W, H))
+mlp_up2 = MLPUpsampler(C*2, embed_dims=16, upsample_to_size=(W, H))
+mlp_up3 = MLPUpsampler(C*4, embed_dims=16, upsample_to_size=(W, H))
+mlp_up4 = MLPUpsampler(C*8, embed_dims=16, upsample_to_size=(W, H))
+
+res1 = mlp_up1(F1)
+res2 = mlp_up2(F2)
+res3 = mlp_up3(F3)
+res4 = mlp_up4(F4)
+
+assert res1.shape == (N, 16, W, H), res1.shape
+assert res2.shape == (N, 16, W, H), res2.shape
+assert res3.shape == (N, 16, W, H), res3.shape
+assert res4.shape == (N, 16, W, H), res4.shape
+
+print(f"MLP Upsampler assert passed | Elapsed time: {time.time() - start:.4f}s")
+
+fuse = MLPFusion(embed_dims=16)
+res = fuse(res1, res2, res3, res4)
+
+assert res.shape == (N, W*H, 16), res.shape
+print(f"MLP Fusion assert passed | Elapsed time: {time.time() - start:.4f}s")
+
+
+class ConvUpsampleAndClassify(nn.Module):
     def __init__(self, in_channels, out_channels):
-        self.conv = nn.ConvTranspose2d(in_channels=in_channels, out_channels=in_channels, kernel_size=3, stride=4)
+        super().__init__()
+        self.out_channels = out_channels
+
+        # Diverge from original implementation, original implementation 
+        # uses single Transposed Conv with kernel_size=4, stride=4 
+        # to quadruple spatial dims
+
+        self.conv1 = nn.ConvTranspose2d(in_channels=in_channels, out_channels=in_channels, kernel_size=2, stride=2)
+        self.conv2 = nn.ConvTranspose2d(in_channels=in_channels, out_channels=in_channels, kernel_size=2, stride=2)
         self.linear = nn.Linear(in_features=in_channels, out_features=out_channels)
 
     def forward(self, x):
-        x = self.conv(x)
-        return self.linear(x)
+        N, C, W, H = x.shape
+        x = self.conv1(x)
+        x = self.conv2(x)
+        assert x.shape == (N, C, W*4, H*4), x.shape
 
+        x = torch.flatten(x, start_dim=2)
+        x = torch.permute(x, (0, 2, 1))
+
+        class_logits = self.linear(x)
+
+        class_logits = torch.permute(class_logits, (0, 2, 1))
+        class_logits = torch.reshape(class_logits, (N, self.out_channels, W*4, H*4))
+        return class_logits
+
+N, C, W, H = 1, 16, 64, 64
+up_class = ConvUpsampleAndClassify(C, 3)
+x = torch.rand(N, C, W, H)
+res = up_class(x)
+assert res.shape == (N, 3, W*4, H*4), res.shape
+print(f"Conv Upsample and Classify assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class ChangeFormer(nn.Module):
-    def __init__(self, in_channels, n_classes):
+    def __init__(self, in_channels, num_classes, C=[16, 32, 64, 128], embed_dims=64, input_spatial_size=(256, 256)):
+        W, H = input_spatial_size
+        super().__init__()
         self.b1 = nn.Sequential(
-            Downsampling(in_channels, 32),
-            TransformerBlock(32),
+            Downsampling(in_channels, C[0], kernel_size=7, stride=4, padding=3),
+            ConvertToForm("linear"),
+            TransformerBlock(C[0]),
+            ConvertToForm("image"),
         )
         self.b2 = nn.Sequential(
-            Downsampling(32, 64),
-            TransformerBlock(64),
+            Downsampling(C[0], C[1]),
+            ConvertToForm("linear"),
+            TransformerBlock(C[1]),
+            ConvertToForm("image"),
         )
         self.b3 = nn.Sequential(
-            Downsampling(64, 128),
-            TransformerBlock(128),
+            Downsampling(C[1], C[2]),
+            ConvertToForm("linear"),
+            TransformerBlock(C[2]),
+            ConvertToForm("image"),
         )
         self.b4 = nn.Sequential(
-            Downsampling(128, 256),
-            TransformerBlock(256),
+            Downsampling(C[2], C[3]),
+            ConvertToForm("linear"),
+            TransformerBlock(C[3]),
+            ConvertToForm("image"),
         )
+        self.diff1 = DifferenceModule(C[0]*2, C[0])
+        self.diff2 = DifferenceModule(C[1]*2, C[1])
+        self.diff3 = DifferenceModule(C[2]*2, C[2])
+        self.diff4 = DifferenceModule(C[3]*2, C[3])
 
-        pass
-        # to be implemented
+        self.mlp_up1 = MLPUpsampler(C[0], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
+        self.mlp_up2 = MLPUpsampler(C[1], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
+        self.mlp_up3 = MLPUpsampler(C[2], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
+        self.mlp_up4 = MLPUpsampler(C[3], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
 
+        self.to_image_form = ConvertToForm("image")
+        self.to_linear_form = ConvertToForm("linear")
+
+        self.mlp_fusion = MLPFusion(embed_dims)
+        self.upsample_and_classify = ConvUpsampleAndClassify(embed_dims, num_classes)
+    
+    def forward(self, x1, x2):
+        assert x1.shape == x2.shape, f"{x1.shape} != {x2.shape}"
+        x1_1 = self.b1(x1)
+        x1_2 = self.b2(x1_1)
+        x1_3 = self.b3(x1_2)
+        x1_4 = self.b4(x1_3)
+
+        x2_1 = self.b1(x2)
+        x2_2 = self.b2(x2_1)
+        x2_3 = self.b3(x2_2)
+        x2_4 = self.b4(x2_3)
+
+        F1 = self.diff1(x1_1, x2_1)
+        F2 = self.diff2(x1_2, x2_2)
+        F3 = self.diff3(x1_3, x2_3)
+        F4 = self.diff4(x1_4, x2_4)
+
+        up1 = self.mlp_up1(self.to_linear_form(F1))
+        up2 = self.mlp_up2(self.to_linear_form(F2))
+        up3 = self.mlp_up3(self.to_linear_form(F3))
+        up4 = self.mlp_up4(self.to_linear_form(F4))
+        
+        fused = self.mlp_fusion(up1, up2, up3, up4)
+        return self.upsample_and_classify(self.to_image_form(fused))
+
+N, C, W, H = 1, 3, 256, 256
+num_classes = 2
+changeformer = ChangeFormer(C, num_classes)
+
+x1 = torch.rand(N, C, W, H)
+x2 = torch.rand(N, C, W, H)
+
+res = changeformer(x1, x2)
+assert res.shape == (N, num_classes, W, H), res.shape
+
+print(f"ChangeFormer assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 print("All asserts pass.")
