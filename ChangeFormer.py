@@ -1,7 +1,5 @@
-from functools import reduce
 import torch
 import math
-import jaxtyping
 from torch import nn
 import torch.nn.functional as F
 import time
@@ -27,10 +25,11 @@ class ConvertToForm(nn.Module):
             convert to shape (N, C, W, H)
             '''
             N, WH, C = x.shape
+            S = int(WH**0.5)
             x = x.permute(0, 2, 1)
 
-            assert WH == int(WH**0.5) * int(WH**0.5), f'''ConvertToForm("image") error: WH ({WH}) is not perfect square'''
-            x = x.reshape((N, C, int(WH**0.5), int(WH**0.5)))
+            assert WH == S * S, f'''ConvertToForm("image") error: WH ({WH}) is not perfect square'''
+            x = x.reshape((N, C, S, S))
 
             return x
         elif self.target_form == "linear":
@@ -45,6 +44,15 @@ class ConvertToForm(nn.Module):
             return x
         else:
             return -1
+
+def test_conversion():
+    N, C, H, W = 1, 32, 256, 256
+    x = torch.rand(N, C, H, W)
+    lin = ConvertToForm("linear")(x)
+    img = ConvertToForm("image")(lin)
+    assert torch.allclose(x, img), "Mapping mismatch"
+
+    print("Conversion assert pass")
 
 #=============================================
 
@@ -109,30 +117,30 @@ def test_sr():
     print(f"SequenceReducer assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class MHSA(nn.Module):
-    def __init__(self, in_channels, d_head=64, reduce_ratio=4):
+    def __init__(self, in_channels, d_k=256, reduce_ratio=4):
         super().__init__()
         self.reduce_ratio = reduce_ratio
-        self.d_head = d_head
+        self.d_k = d_k
         self.seq_reduce = SequenceReducer(in_channels, reduce_ratio)
-        self.q_proj = nn.Linear(in_channels, d_head)
-        self.k_proj = nn.Linear(in_channels, d_head)
-        self.v_proj = nn.Linear(in_channels, d_head)
-        self.sdpa = SDPA(d_head)
-        self.out_proj = nn.Linear(d_head//reduce_ratio, in_channels)
+        self.q_proj = nn.Linear(in_channels, d_k)
+        self.k_proj = nn.Linear(in_channels, d_k)
+        self.v_proj = nn.Linear(in_channels, d_k)
+        self.sdpa = SDPA(d_k)
+        self.out_proj = nn.Linear(d_k, in_channels*reduce_ratio)
 
     def forward(self, x: torch.Tensor):
         N, WH, C = x.shape
         reduce_ratio = self.reduce_ratio
-        d_head = self.d_head
+        d_k = self.d_k
 
         x = self.seq_reduce(x)
         assert x.shape == (N, WH//reduce_ratio, C), x.shape
 
         x = self.sdpa(self.q_proj(x), self.k_proj(x), self.v_proj(x))
-        assert x.shape == (N, WH//reduce_ratio, d_head), f"{x.shape} != ({N}, {WH//reduce_ratio}, {d_head})"
+        assert x.shape == (N, WH//reduce_ratio, d_k), f"{x.shape} != ({N}, {WH//reduce_ratio}, {d_k})"
         
-        x = x.reshape((N, WH, d_head//reduce_ratio)) # restore spatial dim
-        x = self.out_proj(x) # restore in_channels from d_head
+        x = self.out_proj(x) # learn some upsampling from d_k -> C*reduce_ratio
+        x = x.reshape((N, WH, C)) # restore spatial dim
 
         assert x.shape == (N, WH, C), f"{x.shape} != ({N}, {WH}, {C})"
         return x 
@@ -141,7 +149,7 @@ def test_mhsa():
     N, C, W, H = 1, 32, 128, 128
     d_head = 16
     x = torch.rand(N, W*H, C)
-    mhsa = MHSA(32, d_head=d_head, reduce_ratio=4)
+    mhsa = MHSA(32, d_k=64, reduce_ratio=4)
     res = mhsa(x)
     assert res.shape == (N, W*H, 32), res.shape
     print(f"MHSA assert passed | Elapsed time: {time.time() - start:.4f}s")
@@ -156,17 +164,18 @@ class PositionalEncoder(nn.Module):
         self.gelu = nn.GELU()
         self.mlp_out = nn.Linear(embed_dims, in_channels)
 
+        self.to_image = ConvertToForm("image")
+        self.to_linear = ConvertToForm("linear")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         N, WH, C = x.shape
         x_in = self.mlp_in(x)
         assert x_in.shape == (N, WH, self.embed_dims), x_in.shape
 
-        x_in = torch.permute(x_in, (0, 2, 1))
         assert WH == math.sqrt(WH) * math.sqrt(WH), f"{WH} != {math.sqrt(WH)} * {math.sqrt(WH)}"
-        x_in = torch.reshape(x_in, (N, self.embed_dims, int(math.sqrt(WH)), int(math.sqrt(WH))))
+        x_in = self.to_image(x_in)
         x_in = self.gelu(self.conv(x_in))
-        x_in = torch.flatten(x_in, start_dim=2)
-        x_in = torch.permute(x_in, (0, 2, 1))
+        x_in = self.to_linear(x_in)
 
         return self.mlp_out(x_in) + x
 
@@ -186,7 +195,7 @@ class TransformerBlock(nn.Module):
         self.reduce_ratio = reduce_ratio
         self.blocks = nn.ModuleList([
             nn.Sequential(
-                MHSA(in_channels, d_head=d_head, reduce_ratio=reduce_ratio),
+                MHSA(in_channels, d_k=d_head, reduce_ratio=reduce_ratio),
                 PositionalEncoder(in_channels, embed_dims=pos_embed_dims)
             )
             for _ in range(N)
@@ -269,6 +278,7 @@ class MLPUpsampler(nn.Module):
         self.embed_dims = embed_dims
         self.linear = nn.Linear(in_features=in_channels, out_features=embed_dims)
         self.output_size = upsample_to_size
+        self.to_image = ConvertToForm("image")
         
     def forward(self, x):
         N, WH, C = x.shape
@@ -276,11 +286,8 @@ class MLPUpsampler(nn.Module):
 
         assert x.shape == (N, WH, self.embed_dims), x.shape
         assert WH == int(WH**0.5) * int(WH**0.5), f"{WH} != {int(WH**0.5)} * {int(WH**0.5)}"
-
-        x = torch.permute(x, (0, 2, 1))
-        assert x.shape == (N, self.embed_dims, WH), x.shape
-
-        x = torch.reshape(x, (N, self.embed_dims, int(WH**0.5), int(WH**0.5)))
+        
+        x = self.to_image(x)
         x = F.interpolate(x, size=self.output_size, mode='bilinear')
         return x
 
@@ -288,13 +295,13 @@ class MLPFusion(nn.Module):
     def __init__(self, embed_dims=64):
         super().__init__()
         self.linear = nn.Linear(in_features=embed_dims*4, out_features=embed_dims)
+        self.to_linear = ConvertToForm("linear")
 
     def forward(self, x1, x2, x3, x4):
         N, C, W, H = x1.shape
 
         x = torch.cat([x1, x2, x3, x4], dim=1)
-        x = torch.flatten(x, start_dim=2)
-        x = torch.permute(x, (0, 2, 1))
+        x = self.to_linear(x)
 
         return self.linear(x)
 
@@ -341,6 +348,8 @@ class ConvUpsampleAndClassify(nn.Module):
         self.conv1 = nn.ConvTranspose2d(in_channels=in_channels, out_channels=in_channels, kernel_size=2, stride=2)
         self.conv2 = nn.ConvTranspose2d(in_channels=in_channels, out_channels=in_channels, kernel_size=2, stride=2)
         self.linear = nn.Linear(in_features=in_channels, out_features=out_channels)
+        self.to_linear = ConvertToForm("linear")
+        self.to_image = ConvertToForm("image")
 
     def forward(self, x):
         N, C, W, H = x.shape
@@ -348,13 +357,11 @@ class ConvUpsampleAndClassify(nn.Module):
         x = self.conv2(x)
         assert x.shape == (N, C, W*4, H*4), x.shape
 
-        x = torch.flatten(x, start_dim=2)
-        x = torch.permute(x, (0, 2, 1))
+        x = self.to_linear(x)
 
         class_logits = self.linear(x)
 
-        class_logits = torch.permute(class_logits, (0, 2, 1))
-        class_logits = torch.reshape(class_logits, (N, self.out_channels, W*4, H*4))
+        class_logits = self.to_image(class_logits)
         return class_logits
 
 def test_conv_up_and_classify():
@@ -366,31 +373,31 @@ def test_conv_up_and_classify():
     print(f"Conv Upsample and Classify assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class ChangeFormer(nn.Module):
-    def __init__(self, in_channels, num_classes, N=[4, 4, 4, 4], C=[16, 32, 64, 128], embed_dims=64, input_spatial_size=(256, 256)):
+    def __init__(self, in_channels, num_classes, N=[4, 4, 4, 4], C=[16, 32, 64, 128], embed_dims=256, input_spatial_size=(256, 256), reduction_ratio=4, pos_embed_dims=[128, 128, 128, 128]):
         W, H = input_spatial_size
         super().__init__()
         self.b1 = nn.Sequential(
             Downsampling(in_channels, C[0], kernel_size=7, stride=4, padding=3),
             ConvertToForm("linear"),
-            TransformerBlock(C[0], N=N[0]),
+            TransformerBlock(C[0], N=N[0], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[0]),
             ConvertToForm("image"),
         )
         self.b2 = nn.Sequential(
             Downsampling(C[0], C[1]),
             ConvertToForm("linear"),
-            TransformerBlock(C[1], N=N[1]),
+            TransformerBlock(C[1], N=N[1], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[1]),
             ConvertToForm("image"),
         )
         self.b3 = nn.Sequential(
             Downsampling(C[1], C[2]),
             ConvertToForm("linear"),
-            TransformerBlock(C[2], N=N[2]),
+            TransformerBlock(C[2], N=N[2], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[2]),
             ConvertToForm("image"),
         )
         self.b4 = nn.Sequential(
             Downsampling(C[2], C[3]),
             ConvertToForm("linear"),
-            TransformerBlock(C[3], N=N[3]),
+            TransformerBlock(C[3], N=N[3], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[3]),
             ConvertToForm("image"),
         )
         self.diff1 = DifferenceModule(C[0]*2, C[0])
@@ -448,6 +455,8 @@ def test_changeformer():
     print(f"ChangeFormer assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 if __name__ == "__main__":
+    test_conversion()
+    test_sdpa()
     test_changeformer()     
     print("All asserts pass.")
 
