@@ -3,6 +3,7 @@ import math
 from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from timm.layers.drop import DropPath
 import time
 
 
@@ -86,26 +87,26 @@ class SDPA(nn.Module):
         self.scale = d_head ** 0.5
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-        N, HW, C = Q.shape
-        logits = torch.bmm(Q, K.transpose(1, 2))
+        N, num_heads, HW, C = Q.shape
+        logits = torch.matmul(Q, K.transpose(-2, -1))
         logits /= self.scale
-        assert logits.shape == (N, HW, HW), logits.shape
+        assert logits.shape == (N, num_heads, HW, HW), logits.shape
 
         attn = F.softmax(logits, dim=-1)
-        return torch.bmm(attn, V)
+        return torch.matmul(attn, V)
 
 def test_sdpa():
     N = 1
     C = 3
     H = 64
     W = 64
-    q = torch.rand(N, (H*W), C)
-    k = torch.rand(N, (H*W), C)
-    v = torch.rand(N, (H*W), C)
+    q = torch.rand(N, 1, (H*W), C)
+    k = torch.rand(N, 1, (H*W), C)
+    v = torch.rand(N, 1, (H*W), C)
 
     sdpa = SDPA(d_head=64)
     res = sdpa(q, k, v)
-    assert res.shape == (N, H*W, C), res
+    assert res.shape == (N, 1,H*W, C), res.shape
     print(f"SDPA assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class SequenceReducer(nn.Module):
@@ -136,16 +137,22 @@ def test_sr():
     print(f"SequenceReducer assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class MHSA(nn.Module):
-    def __init__(self, in_channels, d_k=256, reduce_ratio=4):
+    def __init__(self, in_channels, d_model=256, reduce_ratio=4, drop_path_rate=0.1, num_heads=8):
         super().__init__()
+        assert d_model % num_heads == 0, f"d_model must be divisible with num_heads"
+        d_head = d_model//num_heads
+        self.d_head = d_head
+        self.num_heads = num_heads
+        self.drop_path = DropPath(drop_path_rate)
+        
         self.reduce_ratio = reduce_ratio
-        self.d_k = d_k
         self.seq_reduce = SequenceReducer(in_channels, reduce_ratio)
 
-        self.q_proj = nn.Linear(in_channels, d_k)
-        self.k_proj = nn.Linear(in_channels, d_k)
-        self.v_proj = nn.Linear(in_channels, d_k)
-        self.sdpa = SDPA(d_k)
+        self.q_proj = nn.Linear(in_channels, d_head*num_heads)
+        self.k_proj = nn.Linear(in_channels, d_head*num_heads)
+        self.v_proj = nn.Linear(in_channels, d_head*num_heads)
+
+        self.sdpa = SDPA(d_head)
 
         # restore spatial dims by a learnable upsampling from patches (W/R, H/R) -> original WxH
 
@@ -154,14 +161,14 @@ class MHSA(nn.Module):
 
         # Solutions: 
         # 1. Set convtranspose kernel size to be divisible by stride,
-        kernel_size = reduce_ratio
-        stride = reduce_ratio//2
-        assert kernel_size % stride == 0, "kernel_size must be divisible by stride"
+        #kernel_size = reduce_ratio
+        #stride = reduce_ratio//2
+        #assert kernel_size % stride == 0, "kernel_size must be divisible by stride"
         #self.upsample1 = nn.ConvTranspose2d(d_k, in_channels*reduce_ratio, kernel_size=reduce_ratio, stride=1)
         #self.upsample2 = nn.ConvTranspose2d(d_k, in_channels*reduce_ratio, kernel_size=reduce_ratio, stride=1)
 
         # 2. Use Bilinear/NN resize, then apply convolution -> simpler
-        self.upsample = nn.Conv2d(d_k, in_channels, kernel_size=1)
+        self.upsample = nn.Conv2d(d_model, in_channels, kernel_size=1)
 
         self.to_image = ConvertToForm("image")
         self.to_linear = ConvertToForm("linear")
@@ -169,25 +176,37 @@ class MHSA(nn.Module):
     def forward(self, x: torch.Tensor):
         N, C, W, H = x.shape
         reduce_ratio = self.reduce_ratio
-        d_k = self.d_k
+        d_head = self.d_head
+        num_heads = self.num_heads
+        d_model = d_head*num_heads
 
         #seq_to_image(self.to_linear(x), title="before seq_reduce")
 
-        x_reduced = self.seq_reduce(x)
+        x_reduced = self.seq_reduce(x) if self.reduce_ratio > 1 else x
         assert x_reduced.shape == (N, C, W//reduce_ratio, H//reduce_ratio), x_reduced.shape
 
         #seq_to_image(self.to_linear(x_reduced), title="after seq_reduce, before sdpa")
 
         x_reduced = self.to_linear(x_reduced)
-        x_attn = self.sdpa(self.q_proj(x_reduced),
-                      self.k_proj(x_reduced),
-                      self.v_proj(x_reduced))
+        N, WH_reduced, C = x_reduced.shape
+        Q = self.q_proj(x_reduced)
+        K = self.k_proj(x_reduced)
+        V = self.v_proj(x_reduced)
+        
+        
+        Q = Q.view(N, WH_reduced, num_heads, d_head).transpose(1, 2) #(N, num_heads, WH_reduced, d_head)
+        K = K.view(N, WH_reduced, num_heads, d_head).transpose(1, 2)
+        V = V.view(N, WH_reduced, num_heads, d_head).transpose(1, 2)
 
-        assert x_attn.shape == (N, (W*H)//(reduce_ratio**2), d_k), f"{x_attn.shape} != ({N}, {(W*H)//(reduce_ratio**2)}, {d_k})"
+        x_attn = self.sdpa(Q, K, V)
+        assert x_attn.shape == (N, num_heads, WH_reduced, d_head), x_attn.shape
+        x_attn = x_attn.transpose(1, 2).flatten(start_dim=2)
+
+        assert x_attn.shape == (N, (W*H)//(reduce_ratio**2), d_model), f"{x_attn.shape} != ({N}, {(W*H)//(reduce_ratio**2)}, {d_model})"
         #seq_to_image(x_attn, title="after sdpa, before proj")
 
         x_attn = self.to_image(x_attn)
-        assert x_attn.shape == (N, d_k, W//reduce_ratio, H//reduce_ratio), f"{x_attn.shape} != ({N}, {d_k}, {W//reduce_ratio}, {H//reduce_ratio})"
+        assert x_attn.shape == (N, d_model, W//reduce_ratio, H//reduce_ratio), f"{x_attn.shape} != ({N}, {d_model}, {W//reduce_ratio}, {H//reduce_ratio})"
 
         x_attn = F.interpolate(x_attn, scale_factor=reduce_ratio, mode='nearest')
         x_restored = self.upsample(x_attn)
@@ -195,7 +214,7 @@ class MHSA(nn.Module):
 
         assert x_restored.shape == (N, C, W, H), f"{x_restored.shape} != ({N}, {C}, {W}, {H})"
         #seq_to_image(self.to_linear(x_restored), title="after sdpa, after proj")
-        x = x_restored + x
+        x = self.drop_path(x_restored) + x
         #seq_to_image(self.to_linear(x_restored), title="after sdpa, after proj, after residual with input")
 
         return x 
@@ -203,15 +222,16 @@ class MHSA(nn.Module):
 def test_mhsa():
     N, C, W, H = 1, 32, 256, 256
     x = torch.rand(N, C, W, H)
-    mhsa = MHSA(32, d_k=64, reduce_ratio=4)
+    mhsa = MHSA(32, d_model=64, reduce_ratio=4)
     res = mhsa(x)
     assert res.shape == (N, C, W, H), res.shape
     print(f"MHSA assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 
 class PositionalEncoder(nn.Module):
-    def __init__(self, in_channels, embed_dims=64):
+    def __init__(self, in_channels, embed_dims=64, drop_path_rate=0.1):
         super().__init__()
+        self.drop_path = DropPath(drop_path_rate)
         self.embed_dims = embed_dims
         self.mlp_in = nn.Conv2d(in_channels, embed_dims, kernel_size=1)
         self.conv = nn.Conv2d(embed_dims, embed_dims, kernel_size=3, groups=embed_dims, padding=1, padding_mode="reflect") # depthwise conv
@@ -226,7 +246,7 @@ class PositionalEncoder(nn.Module):
         x_in = self.mlp_in(x)
         assert x_in.shape == (N, self.embed_dims, W, H), x_in.shape
         x_in = self.gelu(self.conv(x_in))
-        return self.mlp_out(x_in) + x
+        return self.drop_path(self.mlp_out(x_in)) + x
 
 def test_pos_enc():
     pe = PositionalEncoder(32, embed_dims=64)
@@ -239,13 +259,17 @@ def test_pos_enc():
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, in_channels, N=4, reduce_ratio=16, d_head=64, pos_embed_dims=64): 
+    def __init__(self, in_channels, N=4, reduce_ratio=16, d_model=64, num_heads=8, pos_embed_dims=64, mhsa_drop_rate=0.1, posenc_drop_rate=0.1): 
         super().__init__()
-        self.reduce_ratio = reduce_ratio
         self.blocks = nn.ModuleList([
             nn.Sequential(
-                MHSA(in_channels, d_k=d_head, reduce_ratio=reduce_ratio),
-                PositionalEncoder(in_channels, embed_dims=pos_embed_dims)
+                MHSA(in_channels, 
+                     d_model=d_model, 
+                     reduce_ratio=reduce_ratio, 
+                     drop_path_rate=mhsa_drop_rate, 
+                     num_heads=num_heads
+                ),
+                PositionalEncoder(in_channels, embed_dims=pos_embed_dims, drop_path_rate=posenc_drop_rate)
             )
             for _ in range(N)
         ])
@@ -409,24 +433,45 @@ def test_conv_up_and_classify():
     print(f"Conv Upsample and Classify assert passed | Elapsed time: {time.time() - start:.4f}s")
 
 class ChangeFormer(nn.Module):
-    def __init__(self, in_channels, num_classes, N=[4, 4, 4, 4], C=[16, 32, 64, 128], embed_dims=256, input_spatial_size=(256, 256), reduction_ratio=4, pos_embed_dims=[128, 128, 128, 128]):
+    def __init__(self, in_channels, 
+                 num_classes, 
+                 input_spatial_size=(256, 256), 
+                 N=[3, 3, 4, 3], 
+                 C=[64, 128, 256, 512], 
+                 embed_dims=256, 
+                 d_models=[64, 128, 256, 256],
+                 num_heads=[8, 8, 8, 8],
+                 reduction_ratio=[8, 8, 4, 2], 
+                 pos_embed_dims=[256, 256, 256, 256],
+                 mhsa_drop_rates=[0.1, 0.1, 0.1, 0.1],
+                 posenc_drop_rates=[0.1, 0.1, 0.1, 0.1]
+                 ):
         W, H = input_spatial_size
         super().__init__()
         self.b1 = nn.Sequential(
             Downsampling(in_channels, C[0], kernel_size=7, stride=4, padding=3),
-            TransformerBlock(C[0], N=N[0], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[0]),
+            TransformerBlock(C[0], N=N[0], reduce_ratio=reduction_ratio[0], pos_embed_dims=pos_embed_dims[0],
+                             mhsa_drop_rate=mhsa_drop_rates[0], posenc_drop_rate=posenc_drop_rates[0], 
+                             num_heads=num_heads[0], d_model=d_models[0])
         )
         self.b2 = nn.Sequential(
             Downsampling(C[0], C[1]),
-            TransformerBlock(C[1], N=N[1], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[1]),
+            TransformerBlock(C[1], N=N[1], reduce_ratio=reduction_ratio[1], pos_embed_dims=pos_embed_dims[1],
+                             mhsa_drop_rate=mhsa_drop_rates[1], posenc_drop_rate=posenc_drop_rates[1],
+                             num_heads=num_heads[1], d_model=d_models[1])
         )
         self.b3 = nn.Sequential(
             Downsampling(C[1], C[2]),
-            TransformerBlock(C[2], N=N[2], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[2]),
+            TransformerBlock(C[2], N=N[2], reduce_ratio=reduction_ratio[2], pos_embed_dims=pos_embed_dims[2],
+                             mhsa_drop_rate=mhsa_drop_rates[2], posenc_drop_rate=posenc_drop_rates[2],
+                             num_heads=num_heads[2], d_model=d_models[2])
         )
         self.b4 = nn.Sequential(
             Downsampling(C[2], C[3]),
-            TransformerBlock(C[3], N=N[3], reduce_ratio=reduction_ratio, pos_embed_dims=pos_embed_dims[3]),
+            TransformerBlock(C[3], N=N[3], reduce_ratio=reduction_ratio[3], pos_embed_dims=pos_embed_dims[3],
+                             mhsa_drop_rate=mhsa_drop_rates[3], posenc_drop_rate=posenc_drop_rates[3],
+                             num_heads=num_heads[3], d_model=d_models[3])
+
         )
         self.diff1 = DifferenceModule(C[0]*2, C[0])
         self.diff2 = DifferenceModule(C[1]*2, C[1])
@@ -513,5 +558,3 @@ if __name__ == "__main__":
     test_transformer()
     test_changeformer()     
     print("All asserts pass.")
-
-
