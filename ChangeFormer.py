@@ -347,16 +347,14 @@ def test_difference_module():
 #============================================================
 
 class MLPUpsampler(nn.Module):
-    def __init__(self, in_channels, embed_dims=64, upsample_to_size=(128, 128)):
+    def __init__(self, in_channels, embed_dims=64):
         super().__init__()
         self.embed_dims = embed_dims
         self.linear = nn.Conv2d(in_channels, embed_dims, kernel_size=1)
-        self.output_size = upsample_to_size
         
-    def forward(self, x):
-        N, C, W, H = x.shape
+    def forward(self, x, output_size):
         x = self.linear(x);
-        x = F.interpolate(x, size=self.output_size, mode='bilinear')
+        x = F.interpolate(x, size=output_size, mode='bilinear')
         return x
 
 class MLPFusion(nn.Module):
@@ -365,8 +363,6 @@ class MLPFusion(nn.Module):
         self.linear = nn.Conv2d(embed_dims*4, embed_dims, kernel_size=1)
 
     def forward(self, x1, x2, x3, x4):
-        N, C, W, H = x1.shape
-
         x = torch.cat([x1, x2, x3, x4], dim=1)
 
         return self.linear(x)
@@ -378,15 +374,15 @@ def test_mlp_upsampler_and_fusion():
     F3 = torch.rand(N, C*4, W//4, H//4)
     F4 = torch.rand(N, C*8, W//8, H//8)
 
-    mlp_up1 = MLPUpsampler(C, embed_dims=16, upsample_to_size=(W, H))
-    mlp_up2 = MLPUpsampler(C*2, embed_dims=16, upsample_to_size=(W, H))
-    mlp_up3 = MLPUpsampler(C*4, embed_dims=16, upsample_to_size=(W, H))
-    mlp_up4 = MLPUpsampler(C*8, embed_dims=16, upsample_to_size=(W, H))
+    mlp_up1 = MLPUpsampler(C, embed_dims=16)
+    mlp_up2 = MLPUpsampler(C*2, embed_dims=16)
+    mlp_up3 = MLPUpsampler(C*4, embed_dims=16)
+    mlp_up4 = MLPUpsampler(C*8, embed_dims=16)
 
-    res1 = mlp_up1(F1)
-    res2 = mlp_up2(F2)
-    res3 = mlp_up3(F3)
-    res4 = mlp_up4(F4)
+    res1 = mlp_up1(F1, output_size=(W, H))
+    res2 = mlp_up2(F2, output_size=(W, H))
+    res3 = mlp_up3(F3, output_size=(W, H))
+    res4 = mlp_up4(F4, output_size=(W, H))
 
     assert res1.shape == (N, 16, W, H), res1.shape
     assert res2.shape == (N, 16, W, H), res2.shape
@@ -435,7 +431,6 @@ def test_conv_up_and_classify():
 class ChangeFormer(nn.Module):
     def __init__(self, in_channels, 
                  num_classes, 
-                 input_spatial_size=(256, 256), 
                  N=[3, 3, 4, 3], 
                  C=[64, 128, 256, 512], 
                  embed_dims=256, 
@@ -446,7 +441,6 @@ class ChangeFormer(nn.Module):
                  mhsa_drop_rates=[0.1, 0.1, 0.1, 0.1],
                  posenc_drop_rates=[0.1, 0.1, 0.1, 0.1]
                  ):
-        W, H = input_spatial_size
         super().__init__()
         self.b1 = nn.Sequential(
             Downsampling(in_channels, C[0], kernel_size=7, stride=4, padding=3),
@@ -478,10 +472,10 @@ class ChangeFormer(nn.Module):
         self.diff3 = DifferenceModule(C[2]*2, C[2])
         self.diff4 = DifferenceModule(C[3]*2, C[3])
 
-        self.mlp_up1 = MLPUpsampler(C[0], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
-        self.mlp_up2 = MLPUpsampler(C[1], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
-        self.mlp_up3 = MLPUpsampler(C[2], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
-        self.mlp_up4 = MLPUpsampler(C[3], embed_dims=embed_dims, upsample_to_size=(W//4, H//4))
+        self.mlp_up1 = MLPUpsampler(C[0], embed_dims=embed_dims)
+        self.mlp_up2 = MLPUpsampler(C[1], embed_dims=embed_dims)
+        self.mlp_up3 = MLPUpsampler(C[2], embed_dims=embed_dims)
+        self.mlp_up4 = MLPUpsampler(C[3], embed_dims=embed_dims)
 
         self.mlp_fusion = MLPFusion(embed_dims)
         self.upsample_and_classify = ConvUpsampleAndClassify(embed_dims, num_classes)
@@ -503,10 +497,10 @@ class ChangeFormer(nn.Module):
         F3 = self.diff3(x1_3, x2_3)
         F4 = self.diff4(x1_4, x2_4)
 
-        up1 = self.mlp_up1(F1)
-        up2 = self.mlp_up2(F2)
-        up3 = self.mlp_up3(F3)
-        up4 = self.mlp_up4(F4)
+        up1 = self.mlp_up1(F1, output_size=x1_1.shape[-2:])
+        up2 = self.mlp_up2(F2, output_size=x1_1.shape[-2:])
+        up3 = self.mlp_up3(F3, output_size=x1_1.shape[-2:])
+        up4 = self.mlp_up4(F4, output_size=x1_1.shape[-2:])
         
         fused = self.mlp_fusion(up1, up2, up3, up4)
         out = self.upsample_and_classify(fused)
