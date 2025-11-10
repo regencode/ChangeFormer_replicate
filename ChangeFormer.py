@@ -360,8 +360,7 @@ class DifferenceModule(nn.Module):
         x_pre = self.proj_pre(x_pre)
         x_post = self.proj_post(x_post)
         x = torch.cat([x_pre, x_post], dim=1) # concat along dim
-        x = F.relu(self.conv1(x));
-        x = self.bn(x);
+        x = F.relu(self.bn(self.conv1(x)));
         return F.relu(self.conv2(x))
 
 def test_difference_module():
@@ -469,17 +468,14 @@ def test_conv_up_and_classify():
     assert res.shape == (N, 3, W*4, H*4), res.shape
     print(f"Conv Upsample and Classify assert passed | Elapsed time: {time.time() - start:.4f}s")
 
-class ChangeFormer(nn.Module):
-    def __init__(self, in_channels, 
-                 num_classes, 
+class ChangeFormerEncoder(nn.Module):
+    def __init__(self, in_channels,
                  N=[3, 3, 4, 3], 
                  C=[64, 128, 256, 512], 
-                 embed_dims=256, 
                  num_heads=[8, 8, 8, 8],
                  pos_embed_dims=[256, 256, 256, 256],
                  mhsa_drop_rates=[0.1, 0.1, 0.1, 0.1],
-                 posenc_drop_rates=[0.1, 0.1, 0.1, 0.1]
-                 ):
+                 posenc_drop_rates=[0.1, 0.1, 0.1, 0.1]):
         super().__init__()
         self.b1 = nn.Sequential(
             OverlapPatchEmbed(in_channels, embed_dim=C[0], kernel_size=7, stride=4, padding=3),
@@ -509,8 +505,21 @@ class ChangeFormer(nn.Module):
                              mhsa_drop_rate=mhsa_drop_rates[3], posenc_drop_rate=posenc_drop_rates[3],
                              num_heads=num_heads[3]),
             ConvertToForm("image")
-
         )
+
+    def forward(self, x):
+        x1 = self.b1(x)
+        x2 = self.b2(x1)
+        x3 = self.b3(x2)
+        x4 = self.b4(x3)
+        return x1, x2, x3, x4
+
+
+class ChangeFormerDecoder(nn.Module):
+    def __init__(self, num_classes,
+                 C=[64, 128, 256, 512], 
+                 embed_dims=256):
+        super().__init__()
         self.diff1 = DifferenceModule(C[0], embed_dims)
         self.diff2 = DifferenceModule(C[1], embed_dims)
         self.diff3 = DifferenceModule(C[2], embed_dims)
@@ -524,23 +533,14 @@ class ChangeFormer(nn.Module):
         self.mlp_fusion = MLPFusion(embed_dims)
         self.upsample_and_classify = ConvUpsampleAndClassify(embed_dims, num_classes)
     
-    def forward(self, x1, x2, return_intermediate=False):
-        assert x1.shape == x2.shape, f"{x1.shape} != {x2.shape}"
-        x1_1 = self.b1(x1)
-        x1_2 = self.b2(x1_1)
-        x1_3 = self.b3(x1_2)
-        x1_4 = self.b4(x1_3)
-
-        x2_1 = self.b1(x2)
-        x2_2 = self.b2(x2_1)
-        x2_3 = self.b3(x2_2)
-        x2_4 = self.b4(x2_3)
+    def forward(self, x1s, x2s, return_intermediate=False):
+        x1_1, x1_2, x1_3, x1_4 = x1s
+        x2_1, x2_2, x2_3, x2_4 = x2s
 
         F4 = self.diff4(x1_4, x2_4)
-        F3 = self.diff3(x1_3, x2_3) + F.interpolate(F4, scale_factor=2, mode="nearest")
-        F2 = self.diff2(x1_2, x2_2) + F.interpolate(F3, scale_factor=2, mode="nearest")
-        F1 = self.diff1(x1_1, x2_1) + F.interpolate(F2, scale_factor=2, mode="nearest")
-
+        F3 = self.diff3(x1_3, x2_3) + F.interpolate(F4, scale_factor=2, mode="bilinear")
+        F2 = self.diff2(x1_2, x2_2) + F.interpolate(F3, scale_factor=2, mode="bilinear")
+        F1 = self.diff1(x1_1, x2_1) + F.interpolate(F2, scale_factor=2, mode="bilinear")
 
         up1 = self.mlp_up1(F1, output_size=x1_1.shape[-2:])
         up2 = self.mlp_up2(F2, output_size=x1_1.shape[-2:])
@@ -556,10 +556,44 @@ class ChangeFormer(nn.Module):
             return out
 
 
+class ChangeFormer(nn.Module):
+    def __init__(self, in_channels, 
+                 num_classes, 
+                 N=[3, 3, 4, 3], 
+                 C=[64, 128, 256, 512], 
+                 embed_dims=256, 
+                 num_heads=[8, 8, 8, 8],
+                 pos_embed_dims=[256, 256, 256, 256],
+                 mhsa_drop_rates=[0.1, 0.1, 0.1, 0.1],
+                 posenc_drop_rates=[0.1, 0.1, 0.1, 0.1]
+                 ):
+        super().__init__()
+        self.encoder = ChangeFormerEncoder(
+            in_channels=in_channels,
+            N=N,
+            C=C,
+            num_heads=num_heads,
+            pos_embed_dims=pos_embed_dims,
+            mhsa_drop_rates=mhsa_drop_rates,
+            posenc_drop_rates=posenc_drop_rates
+        )
+        self.decoder = ChangeFormerDecoder(
+            num_classes=num_classes,
+            C=C,
+            embed_dims=embed_dims
+        )
+
+    def forward(self, x1, x2):
+        assert x1.shape == x2.shape, f"{x1.shape} != {x2.shape}"
+        x1s = self.encoder(x1)
+        x2s = self.encoder(x2)
+        return self.decoder(x1s, x2s)
+
+
 def test_changeformer():
-    N, C, W, H = 1, 3, 256, 256
+    N, C, W, H = 1, 3, 64, 64
     num_classes = 2
-    changeformer = ChangeFormer(C, num_classes)
+    changeformer = ChangeFormer(C, num_classes, N=[2, 2, 2, 2])
 
     x1 = torch.rand(N, C, W, H)
     x2 = torch.rand(N, C, W, H)
